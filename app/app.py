@@ -1,10 +1,12 @@
 import sys
 import os
+import time
+import shutil
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import streamlit as st
-import numpy as np
+from streamlit_pdf_viewer import pdf_viewer
 
 from ingestion.pdf_loader import load_pdf_text
 from ingestion.text_splitter import split_text
@@ -14,12 +16,70 @@ from rag.rag_pipeline import run_rag
 from config import *
 
 
+# ---------------- CONFIG ---------------- #
+
+st.set_page_config(
+    page_title="GenAI PDF Assistant",
+    page_icon="📄",
+    layout="wide"
+)
+
+UPLOAD_PATH = "data/raw"
 
 
-st.set_page_config(page_title="GenAI RAG DocQA")
+# ---------------- HEADER ---------------- #
 
-st.title("📄 GenAI Document Q&A")
+st.markdown(
+    """
+    <h1 style="text-align:center; color:#4CAF50;">
+        📄 GenAI PDF Assistant
+    </h1>
+    <p style="text-align:center; color:gray;">
+        Upload, View & Ask Questions from PDFs
+    </p>
+    """,
+    unsafe_allow_html=True
+)
 
+
+# ---------------- SIDEBAR ---------------- #
+
+st.sidebar.title("📂 Upload PDF")
+
+uploaded_file = st.sidebar.file_uploader(
+    "Upload a PDF",
+    type=["pdf"]
+)
+
+st.sidebar.markdown("---")
+st.sidebar.info("Upload → View → Ask → Learn")
+
+
+# ---------------- UTILITY ---------------- #
+
+def clear_old_data():
+
+    if os.path.exists(PROCESSED_PATH):
+        shutil.rmtree(PROCESSED_PATH)
+
+    os.makedirs(PROCESSED_PATH, exist_ok=True)
+
+
+# ---------------- PAGE TEXT EXTRACTOR ---------------- #
+
+def extract_page_text(pdf_path, page_no):
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(pdf_path)
+
+    if page_no < 0 or page_no >= len(reader.pages):
+        return ""
+
+    return reader.pages[page_no].extract_text()
+
+
+# ---------------- SETUP SYSTEM ---------------- #
 
 @st.cache_resource
 def setup_system():
@@ -30,12 +90,14 @@ def setup_system():
         index, texts = load_index(PROCESSED_PATH)
 
     else:
+
         texts = []
 
-        for file in os.listdir(DATA_PATH):
+        for file in os.listdir(UPLOAD_PATH):
 
             if file.endswith(".pdf"):
-                path = f"{DATA_PATH}/{file}"
+
+                path = f"{UPLOAD_PATH}/{file}"
 
                 text = load_pdf_text(path)
 
@@ -48,14 +110,13 @@ def setup_system():
                 texts.extend(chunks)
 
         if len(texts) == 0:
-            raise ValueError("No PDF files found in data/raw")
+            return None, None, None
 
         embeddings = model.encode(
             texts,
             batch_size=32,
             show_progress_bar=True
         )
-
 
         index = create_faiss_index(embeddings)
 
@@ -64,24 +125,169 @@ def setup_system():
     return model, index, texts
 
 
+# ---------------- HANDLE UPLOAD ---------------- #
+
+pdf_path = None
+
+if uploaded_file:
+
+    os.makedirs(UPLOAD_PATH, exist_ok=True)
+
+    pdf_path = os.path.join(UPLOAD_PATH, uploaded_file.name)
+
+    with open(pdf_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    clear_old_data()
+
+    st.cache_resource.clear()
+
+    st.success("✅ PDF Uploaded Successfully")
+    st.info("Processing document...")
+
+
+# ---------------- LOAD SYSTEM ---------------- #
+
 embed_model, index, texts = setup_system()
 
 
-query = st.text_input("Ask your question:")
+# ---------------- MAIN LAYOUT ---------------- #
 
-if st.button("Get Answer"):
+left, right = st.columns([1, 1])
 
-    if query.strip() == "":
+
+# ---------------- PDF VIEWER ---------------- #
+
+with left:
+
+    st.markdown("## 📘 PDF Preview")
+
+    if pdf_path:
+
+        pdf_viewer(pdf_path)
+
+    else:
+        st.info("Upload a PDF to preview")
+
+
+# ---------------- QUESTION PANEL ---------------- #
+
+with right:
+
+    st.markdown("## 💬 Ask Questions")
+
+    if pdf_path:
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(pdf_path)
+        total_pages = len(reader.pages)
+
+        page_no = st.selectbox(
+            "Select Page (Optional)",
+            options=["All Pages"] + list(range(1, total_pages + 1))
+        )
+
+    else:
+        page_no = None
+
+
+    query = st.text_input(
+        "Enter your question:",
+        placeholder="e.g. Explain this topic"
+    )
+
+
+    col1, col2 = st.columns(2)
+
+    ask_btn = col1.button("🚀 Ask AI")
+    explain_btn = col2.button("📖 Explain Page")
+
+
+# ---------------- ANSWERS ---------------- #
+
+if ask_btn:
+
+    if pdf_path is None:
+        st.warning("Upload a PDF first")
+
+    elif query.strip() == "":
         st.warning("Enter a question")
 
     else:
 
-        answer = run_rag(
-            query,
-            embed_model,
-            index,
-            texts
-        )
+        with st.spinner("Thinking... 🤔"):
 
-        st.success("Answer:")
+            if page_no == "All Pages":
+
+                answer = run_rag(
+                    query,
+                    embed_model,
+                    index,
+                    texts
+                )
+
+            else:
+
+                page_text = extract_page_text(
+                    pdf_path,
+                    int(page_no) - 1
+                )
+
+                prompt = f"""
+Explain based only on this page:
+
+{page_text}
+
+Question: {query}
+"""
+
+                from llm.llm_loader import generate_response
+                answer = generate_response(prompt)
+
+        st.success("✅ Answer")
         st.write(answer)
+
+
+if explain_btn:
+
+    if pdf_path is None:
+        st.warning("Upload a PDF first")
+
+    elif page_no == "All Pages":
+        st.warning("Select a page number")
+
+    else:
+
+        with st.spinner("Analyzing page... 📖"):
+
+            page_text = extract_page_text(
+                pdf_path,
+                int(page_no) - 1
+            )
+
+            prompt = f"""
+Explain this page in simple language:
+
+{page_text}
+"""
+
+            from llm.llm_loader import generate_response
+            answer = generate_response(prompt)
+
+        st.success(f"✅ Page {page_no} Explanation")
+        st.write(answer)
+
+
+# ---------------- FOOTER ---------------- #
+
+st.markdown("---")
+
+st.markdown(
+    """
+    <div style="text-align:center; color:gray;">
+        GenAI PDF Assistant | RAG + Page Analysis
+    </div>
+    """,
+    unsafe_allow_html=True
+)
